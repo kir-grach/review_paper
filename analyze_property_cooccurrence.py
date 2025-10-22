@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import argparse
 import itertools
 import math
 import re
@@ -21,6 +22,75 @@ SENT_MIN_SUPPORT = 5
 TERM_DOC_MIN_SUPPORT = 5
 TOP_N = 15
 SENTENCE_SPLIT_REGEX = re.compile(r"[.!?]+")
+
+
+def read_csv_flexible(path: Path, **kwargs) -> pd.DataFrame:
+    """Read a CSV file while attempting to auto-detect the delimiter."""
+
+    try:
+        return pd.read_csv(path, sep=None, engine="python", **kwargs)
+    except Exception as primary_error:
+        try:
+            return pd.read_csv(path, **kwargs)
+        except Exception:
+            raise primary_error
+
+
+def resolve_input_path(
+    filename: str,
+    provided_path: str,
+    search_locations: Iterable[Path],
+) -> Path:
+    """Resolve the path to an input file with optional overrides and fallbacks."""
+
+    attempted: List[Path] = []
+
+    if provided_path:
+        candidate = Path(provided_path).expanduser()
+        if candidate.is_dir():
+            candidate = candidate / filename
+        attempted.append(candidate)
+        if candidate.is_file():
+            return candidate
+        raise FileNotFoundError(
+            f"Provided path for {filename!r} not found. Tried: {candidate}"
+        )
+
+    for location in search_locations:
+        if location is None:
+            continue
+        base = Path(location).expanduser()
+        if base.is_dir():
+            candidate = base / filename
+        else:
+            candidate = base
+        if candidate in attempted:
+            continue
+        attempted.append(candidate)
+        if candidate.is_file():
+            return candidate
+
+    attempted_str = ", ".join(str(path) for path in attempted if path)
+    raise FileNotFoundError(
+        f"Could not locate required file {filename!r}. Tried: {attempted_str}"
+    )
+
+
+def determine_output_base(output_dir: str, script_dir: Path) -> Path:
+    """Determine where result files should be written, preferring /mnt/data when available."""
+
+    if output_dir:
+        base = Path(output_dir).expanduser()
+    else:
+        preferred = Path("/mnt/data")
+        fallback = script_dir / "data"
+        if preferred.exists():
+            base = preferred
+        else:
+            base = fallback
+
+    base.mkdir(parents=True, exist_ok=True)
+    return base
 
 
 def detect_text_column(df: pd.DataFrame) -> str:
@@ -354,11 +424,46 @@ def save_heatmap(matrix: pd.DataFrame, title: str, output_path: Path) -> None:
 
 
 def main() -> None:
-    soil_terms_path = Path("/mnt/data/soil_terms_25.csv")
-    geoeco_path = Path("/mnt/data/geoeco_results.csv")
-    geomorpho_path = Path("/mnt/data/geomorpho_results.csv")
+    parser = argparse.ArgumentParser(
+        description="Analyze co-occurrence of soil properties and terms across corpora."
+    )
+    parser.add_argument("--soil-terms", type=str, help="Path to soil terms CSV file.")
+    parser.add_argument("--geoeco", type=str, help="Path to GEOECO corpus CSV file.")
+    parser.add_argument(
+        "--geomorpho", type=str, help="Path to GEOMORPHO corpus CSV file."
+    )
+    parser.add_argument(
+        "--data-dir",
+        type=str,
+        help="Directory that contains all required CSV input files.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        help="Directory where analysis outputs will be written.",
+    )
+    args = parser.parse_args()
 
-    soil_df = pd.read_csv(soil_terms_path)
+    script_dir = Path(__file__).resolve().parent
+    search_locations: List[Path] = []
+    if args.data_dir:
+        search_locations.append(Path(args.data_dir))
+    search_locations.extend([script_dir, script_dir / "data", Path.cwd(), Path("/mnt/data")])
+
+    soil_terms_path = resolve_input_path("soil_terms_25.csv", args.soil_terms, search_locations)
+    geoeco_path = resolve_input_path("geoeco_results.csv", args.geoeco, search_locations)
+    geomorpho_path = resolve_input_path(
+        "geomorpho_results.csv", args.geomorpho, search_locations
+    )
+
+    print(f"Using soil terms file: {soil_terms_path}")
+    print(f"Using GEOECO corpus file: {geoeco_path}")
+    print(f"Using GEOMORPHO corpus file: {geomorpho_path}")
+
+    output_base = determine_output_base(args.output_dir, script_dir)
+    print(f"Outputs will be saved under: {output_base}")
+
+    soil_df = read_csv_flexible(soil_terms_path)
 
     properties = soil_df["Soil Property"].tolist()
     property_terms_series = soil_df["Key Terms"].tolist()
@@ -391,8 +496,8 @@ def main() -> None:
         PROPERTY_TERM_PATTERNS[prop] = compiled_terms
         PROPERTY_PATTERNS[prop] = compiled_property_patterns
 
-    geoeco_df = pd.read_csv(geoeco_path)
-    geomorpho_df = pd.read_csv(geomorpho_path)
+    geoeco_df = read_csv_flexible(geoeco_path)
+    geomorpho_df = read_csv_flexible(geomorpho_path)
 
     geoeco_text_col = detect_text_column(geoeco_df)
     geomorpho_text_col = detect_text_column(geomorpho_df)
@@ -452,9 +557,9 @@ def main() -> None:
     sent_output = pd.concat(sent_level_frames, ignore_index=True) if sent_level_frames else pd.DataFrame()
     term_output = pd.concat(term_level_frames, ignore_index=True) if term_level_frames else pd.DataFrame()
 
-    doc_output_path = Path("/mnt/data/cooccurrence_properties_doclevel.csv")
-    sent_output_path = Path("/mnt/data/cooccurrence_properties_sentlevel.csv")
-    term_output_path = Path("/mnt/data/cooccurrence_terms_doclevel.csv")
+    doc_output_path = output_base / "cooccurrence_properties_doclevel.csv"
+    sent_output_path = output_base / "cooccurrence_properties_sentlevel.csv"
+    term_output_path = output_base / "cooccurrence_terms_doclevel.csv"
 
     if not doc_output.empty:
         doc_output = doc_output[
@@ -543,7 +648,7 @@ def main() -> None:
                     )
 
     top_output = pd.DataFrame(top_rows)
-    top_output_path = Path("/mnt/data/top_property_pairs.csv")
+    top_output_path = output_base / "top_property_pairs.csv"
     if not top_output.empty:
         ensure_output_directory(top_output_path)
         top_output.to_csv(top_output_path, index=False)
@@ -571,12 +676,12 @@ def main() -> None:
         np.fill_diagonal(matrix_llr.values, 0.0)
         matrix_npmi.attrs["llr_matrix"] = matrix_llr
 
-        doc_graph_path = Path("/mnt/data/property_network_doclevel.gexf")
+        doc_graph_path = output_base / "property_network_doclevel.gexf"
         ensure_output_directory(doc_graph_path)
         build_network_and_export(matrix_npmi, doc_graph_path, "npmi")
         graph_paths.append(doc_graph_path)
 
-        heatmap_doc_path = Path("/mnt/data/heatmap_properties_doclevel.png")
+        heatmap_doc_path = output_base / "heatmap_properties_doclevel.png"
         save_heatmap(matrix_npmi.fillna(0.0), "Property NPMI (Doc Level)", heatmap_doc_path)
         heatmap_paths.append(heatmap_doc_path)
 
@@ -597,12 +702,12 @@ def main() -> None:
         np.fill_diagonal(matrix_llr.values, 0.0)
         matrix_npmi.attrs["llr_matrix"] = matrix_llr
 
-        sent_graph_path = Path("/mnt/data/property_network_sentlevel.gexf")
+        sent_graph_path = output_base / "property_network_sentlevel.gexf"
         ensure_output_directory(sent_graph_path)
         build_network_and_export(matrix_npmi, sent_graph_path, "npmi")
         graph_paths.append(sent_graph_path)
 
-        heatmap_sent_path = Path("/mnt/data/heatmap_properties_sentlevel.png")
+        heatmap_sent_path = output_base / "heatmap_properties_sentlevel.png"
         save_heatmap(matrix_npmi.fillna(0.0), "Property NPMI (Sentence Level)", heatmap_sent_path)
         heatmap_paths.append(heatmap_sent_path)
 
@@ -618,10 +723,15 @@ def main() -> None:
                 print(f"No {metric.upper()} data for corpus {corpus_name}.")
                 continue
             top10 = subset.sort_values(metric, ascending=False).head(10)
-            print(f"Top 10 property pairs by {metric.upper()} for {corpus_name}:")
+            print(
+                f"Top 10 property pairs by {metric.upper()} for {corpus_name} (CSV format):"
+            )
+            print("property_A,property_B,metric,value,count_AB")
             for _, row in top10.iterrows():
+                value = row[metric]
+                value_str = "" if pd.isna(value) else f"{value:.6f}"
                 print(
-                    f"  {row['property_A']} – {row['property_B']}: {metric.upper()}={row[metric]:.4f}, count_AB={row['count_AB']}"
+                    f"{row['property_A']},{row['property_B']},{metric.upper()},{value_str},{row['count_AB']}"
                 )
 
     saved_paths = [
