@@ -75,8 +75,40 @@ def safe_str_lower(series: pd.Series) -> pd.Series:
         return lower()
 
 
+def read_table_with_fallback(file_path: Path) -> pd.DataFrame:
+    try:
+        df = pd.read_csv(file_path)
+    except pd.errors.ParserError:
+        df = None
+
+    if df is not None:
+        needs_reparse = False
+        if df.shape[1] == 1:
+            header = str(df.columns[0])
+            if any(delimiter in header for delimiter in (";", "\t", "|")):
+                needs_reparse = True
+        if not needs_reparse:
+            return df
+
+    try:
+        return pd.read_csv(file_path, sep=None, engine="python")
+    except (pd.errors.ParserError, TypeError, ValueError):
+        pass
+
+    delimiter = ","
+    try:
+        with file_path.open("r", encoding="utf-8", errors="ignore") as handle:
+            sample = handle.read(4096)
+        dialect = csv.Sniffer().sniff(sample, delimiters=[",", ";", "\t", "|"])
+        delimiter = dialect.delimiter
+    except (csv.Error, OSError):
+        pass
+
+    return pd.read_csv(file_path, sep=delimiter, engine="python")
+
+
 def load_abstracts(file_path: Path, source_name: str) -> List[str]:
-    df = pd.read_csv(file_path)
+    df = read_table_with_fallback(file_path)
     column_name = detect_text_column(df, source_name)
     series = df[column_name]
 
@@ -110,7 +142,7 @@ def parse_key_terms(raw_terms: str) -> List[str]:
 
 
 def load_soil_terms(file_path: Path) -> List[Tuple[str, List[str]]]:
-    df = pd.read_csv(file_path)
+    df = read_table_with_fallback(file_path)
     records: List[Tuple[str, List[str]]] = []
     for _, row in df.iterrows():
         soil_property = str(row.get("Soil Property", "")).strip()
