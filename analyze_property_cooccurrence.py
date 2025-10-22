@@ -5,7 +5,7 @@ import math
 import re
 from collections import Counter
 from pathlib import Path
-from typing import Dict, Iterable, List, Pattern, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Pattern, Set, Tuple
 
 import matplotlib.pyplot as plt
 import networkx as nx
@@ -22,6 +22,10 @@ SENT_MIN_SUPPORT = 5
 TERM_DOC_MIN_SUPPORT = 5
 TOP_N = 15
 SENTENCE_SPLIT_REGEX = re.compile(r"[.!?]+")
+
+UNICODE_DASH_RANGE = "\u2010\u2011\u2012\u2013\u2014\u2015"
+WORD_SEPARATOR_PATTERN = re.compile(rf"[-\\s{UNICODE_DASH_RANGE}]+")
+WORD_SEPARATOR_CLASS = rf"[-\\s{UNICODE_DASH_RANGE}]+"
 
 
 def read_csv_flexible(path: Path, **kwargs) -> pd.DataFrame:
@@ -79,18 +83,29 @@ def resolve_input_path(
 def determine_output_base(output_dir: str, script_dir: Path) -> Path:
     """Determine where result files should be written, preferring /mnt/data when available."""
 
+    candidates: List[Path] = []
     if output_dir:
-        base = Path(output_dir).expanduser()
+        candidates.append(Path(output_dir).expanduser())
     else:
-        preferred = Path("/mnt/data")
-        fallback = script_dir / "data"
-        if preferred.exists():
-            base = preferred
-        else:
-            base = fallback
+        candidates.extend([
+            script_dir,
+            script_dir / "data",
+            Path("/mnt/data"),
+        ])
 
-    base.mkdir(parents=True, exist_ok=True)
-    return base
+    last_error: Optional[Exception] = None
+    for candidate in candidates:
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+        except OSError as error:
+            last_error = error
+            continue
+        else:
+            return candidate
+
+    if last_error is not None:
+        raise last_error
+    raise OSError("Unable to establish output directory.")
 
 
 def detect_text_column(df: pd.DataFrame) -> str:
@@ -121,21 +136,22 @@ def detect_text_column(df: pd.DataFrame) -> str:
 
 
 def _create_phrase_pattern(phrase: str) -> Pattern:
-    tokens = re.split(r"[\s\-]+", phrase.strip())
+    normalized = phrase.strip()
+    tokens_raw = [token for token in WORD_SEPARATOR_PATTERN.split(normalized) if token.strip()]
     pattern_tokens: List[str] = []
-    for token in tokens:
+    for token in tokens_raw:
         token = token.strip()
         if not token:
             continue
         pattern_tokens.append(re.escape(token))
     if not pattern_tokens:
         raise ValueError(f"Cannot build pattern from phrase: {phrase}")
-    base_pattern = r"[\\s\\-]+".join(pattern_tokens)
-    last_token = tokens[-1]
+    base_pattern = WORD_SEPARATOR_CLASS.join(pattern_tokens)
+    last_token = tokens_raw[-1]
     plural_suffix = ""
     if re.search(r"[A-Za-z]$", last_token):
         plural_suffix = r"(?:s|es)?"
-    pattern = rf"\\b{base_pattern}{plural_suffix}\\b"
+    pattern = rf"\b{base_pattern}{plural_suffix}\b"
     return re.compile(pattern, re.IGNORECASE | re.MULTILINE)
 
 
@@ -143,7 +159,7 @@ def _create_abbreviation_pattern(abbreviation: str) -> Pattern:
     abbrev = abbreviation.strip()
     if not abbrev:
         raise ValueError("Abbreviation is empty")
-    pattern = rf"\\b{re.escape(abbrev)}\\b"
+    pattern = rf"\b{re.escape(abbrev)}\b"
     return re.compile(pattern, re.IGNORECASE | re.MULTILINE)
 
 
@@ -442,6 +458,50 @@ def main() -> None:
         type=str,
         help="Directory where analysis outputs will be written.",
     )
+    parser.add_argument(
+        "--doc-min-support",
+        type=int,
+        default=None,
+        help=(
+            "Minimum joint occurrences required for property pairs at the document level. "
+            "Defaults to 3 when not provided."
+        ),
+    )
+    parser.add_argument(
+        "--sent-min-support",
+        type=int,
+        default=None,
+        help=(
+            "Minimum joint occurrences required for property pairs at the sentence level. "
+            "Defaults to 5 when not provided."
+        ),
+    )
+    parser.add_argument(
+        "--term-doc-min-support",
+        type=int,
+        default=None,
+        help=(
+            "Minimum joint occurrences required for term pairs (document level). "
+            "Defaults to 5 when not provided."
+        ),
+    )
+    parser.add_argument(
+        "--focus-properties",
+        type=str,
+        help=(
+            "Optional list of soil properties (separated by commas, semicolons, or pipes) "
+            "to highlight in a dedicated output file."
+        ),
+    )
+    parser.add_argument(
+        "--focus-top-n",
+        type=int,
+        default=5,
+        help=(
+            "When --focus-properties is not supplied, automatically pick the top N properties "
+            "by combined document coverage (default: 5)."
+        ),
+    )
     args = parser.parse_args()
 
     script_dir = Path(__file__).resolve().parent
@@ -449,6 +509,26 @@ def main() -> None:
     if args.data_dir:
         search_locations.append(Path(args.data_dir))
     search_locations.extend([script_dir, script_dir / "data", Path.cwd(), Path("/mnt/data")])
+
+    doc_min_support = args.doc_min_support if args.doc_min_support is not None else DOC_MIN_SUPPORT
+    sent_min_support = (
+        args.sent_min_support if args.sent_min_support is not None else SENT_MIN_SUPPORT
+    )
+    term_doc_min_support = (
+        args.term_doc_min_support
+        if args.term_doc_min_support is not None
+        else TERM_DOC_MIN_SUPPORT
+    )
+
+    doc_min_support = max(1, doc_min_support)
+    sent_min_support = max(1, sent_min_support)
+    term_doc_min_support = max(1, term_doc_min_support)
+    focus_top_n = max(1, args.focus_top_n)
+    focus_properties_input = args.focus_properties
+
+    manual_doc_support = args.doc_min_support is not None
+    manual_sent_support = args.sent_min_support is not None
+    manual_term_support = args.term_doc_min_support is not None
 
     soil_terms_path = resolve_input_path("soil_terms_25.csv", args.soil_terms, search_locations)
     geoeco_path = resolve_input_path("geoeco_results.csv", args.geoeco, search_locations)
@@ -515,6 +595,42 @@ def main() -> None:
         "COMBINED": analyze_corpus(combined_texts),
     }
 
+    combined_doc_analysis = corpora["COMBINED"]["doc"]
+    focus_properties: List[str] = []
+    focus_candidates: List[str] = []
+    if focus_properties_input:
+        focus_candidates = [
+            token.strip()
+            for token in re.split(r"[;,|]", focus_properties_input)
+            if token.strip()
+        ]
+        unknown = [prop for prop in focus_candidates if prop not in PROPERTY_PATTERNS]
+        if unknown:
+            print(
+                "Warning: the following focus properties are not recognized and will be ignored: "
+                + ", ".join(sorted(unknown))
+            )
+        focus_properties = [prop for prop in focus_candidates if prop in PROPERTY_PATTERNS]
+    if not focus_properties:
+        ranked_props = sorted(
+            (
+                (prop, combined_doc_analysis["property_counts"].get(prop, 0))
+                for prop in PROPERTY_PATTERNS.keys()
+            ),
+            key=lambda item: (-item[1], item[0]),
+        )
+        focus_properties = [prop for prop, _ in ranked_props[:focus_top_n]]
+    if not focus_properties:
+        focus_properties = sorted(PROPERTY_PATTERNS.keys())[:focus_top_n]
+    focus_properties = list(dict.fromkeys(focus_properties))
+    if len(focus_properties) > focus_top_n and not focus_properties_input:
+        focus_properties = focus_properties[:focus_top_n]
+    print(
+        "Focus properties for dedicated output: "
+        + (", ".join(focus_properties) if focus_properties else "<none>")
+    )
+    focus_property_set = set(focus_properties)
+
     doc_level_frames = []
     sent_level_frames = []
     term_level_frames = []
@@ -523,35 +639,78 @@ def main() -> None:
         doc_analysis = analysis["doc"]
         sent_analysis = analysis["sent"]
 
+        doc_pair_counts = doc_analysis["pair_counts"]
+        doc_support = doc_min_support
+        max_doc_pair = max(doc_pair_counts.values(), default=0)
+        if not manual_doc_support and max_doc_pair > 0 and doc_support > max_doc_pair:
+            print(
+                f"Lowering document-level support for {corpus_name} from {doc_min_support} to {max_doc_pair} "
+                "to include available property pairs."
+            )
+            doc_support = max_doc_pair
+
         doc_df = generate_pair_metrics(
             doc_analysis["property_counts"],
-            doc_analysis["pair_counts"],
+            doc_pair_counts,
             doc_analysis["N"],
-            DOC_MIN_SUPPORT,
+            doc_support,
         )
         if not doc_df.empty:
             doc_df = doc_df.assign(corpus=corpus_name)
             doc_level_frames.append(doc_df)
+        elif doc_pair_counts and manual_doc_support:
+            print(
+                f"No document-level property pairs for {corpus_name} satisfied the specified support threshold "
+                f"({doc_support}). Consider using --doc-min-support with a smaller value."
+            )
 
+        term_pair_counts = doc_analysis["term_pair_counts"]
+        term_support = term_doc_min_support
+        max_term_pair = max(term_pair_counts.values(), default=0)
+        if not manual_term_support and max_term_pair > 0 and term_support > max_term_pair:
+            print(
+                f"Lowering term-level document support for {corpus_name} from {term_doc_min_support} to {max_term_pair} "
+                "to include available term pairs."
+            )
+            term_support = max_term_pair
         term_df = generate_term_pair_metrics(
             doc_analysis["term_counts"],
-            doc_analysis["term_pair_counts"],
+            term_pair_counts,
             doc_analysis["N"],
-            TERM_DOC_MIN_SUPPORT,
+            term_support,
         )
         if not term_df.empty:
             term_df = term_df.assign(corpus=corpus_name)
             term_level_frames.append(term_df)
+        elif term_pair_counts and manual_term_support:
+            print(
+                f"No term-level document pairs for {corpus_name} satisfied the specified support threshold "
+                f"({term_support}). Consider reducing --term-doc-min-support."
+            )
 
+        sent_pair_counts = sent_analysis["pair_counts"]
+        sent_support = sent_min_support
+        max_sent_pair = max(sent_pair_counts.values(), default=0)
+        if not manual_sent_support and max_sent_pair > 0 and sent_support > max_sent_pair:
+            print(
+                f"Lowering sentence-level support for {corpus_name} from {sent_min_support} to {max_sent_pair} "
+                "to include available property pairs."
+            )
+            sent_support = max_sent_pair
         sent_df = generate_pair_metrics(
             sent_analysis["property_counts"],
-            sent_analysis["pair_counts"],
+            sent_pair_counts,
             sent_analysis["N"],
-            SENT_MIN_SUPPORT,
+            sent_support,
         )
         if not sent_df.empty:
             sent_df = sent_df.assign(corpus=corpus_name)
             sent_level_frames.append(sent_df)
+        elif sent_pair_counts and manual_sent_support:
+            print(
+                f"No sentence-level property pairs for {corpus_name} satisfied the specified support threshold "
+                f"({sent_support}). Consider using --sent-min-support with a smaller value."
+            )
 
     doc_output = pd.concat(doc_level_frames, ignore_index=True) if doc_level_frames else pd.DataFrame()
     sent_output = pd.concat(sent_level_frames, ignore_index=True) if sent_level_frames else pd.DataFrame()
@@ -560,65 +719,109 @@ def main() -> None:
     doc_output_path = output_base / "cooccurrence_properties_doclevel.csv"
     sent_output_path = output_base / "cooccurrence_properties_sentlevel.csv"
     term_output_path = output_base / "cooccurrence_terms_doclevel.csv"
+    focus_output_path = output_base / "focus_properties_relationships.csv"
 
-    if not doc_output.empty:
-        doc_output = doc_output[
-            [
-                "property_A",
-                "property_B",
-                "corpus",
-                "count_A",
-                "count_B",
-                "count_AB",
-                "jaccard",
-                "dice",
-                "pmi",
-                "npmi",
-                "llr",
-            ]
-        ]
-        ensure_output_directory(doc_output_path)
-        doc_output.to_csv(doc_output_path, index=False)
+    doc_columns = [
+        "property_A",
+        "property_B",
+        "corpus",
+        "count_A",
+        "count_B",
+        "count_AB",
+        "jaccard",
+        "dice",
+        "pmi",
+        "npmi",
+        "llr",
+    ]
+    if doc_output.empty:
+        doc_output = pd.DataFrame(columns=doc_columns)
+    else:
+        doc_output = doc_output[doc_columns]
+    ensure_output_directory(doc_output_path)
+    doc_output.to_csv(doc_output_path, index=False)
 
-    if not sent_output.empty:
-        sent_output = sent_output[
-            [
-                "property_A",
-                "property_B",
-                "corpus",
-                "count_A",
-                "count_B",
-                "count_AB",
-                "jaccard",
-                "dice",
-                "pmi",
-                "npmi",
-                "llr",
-            ]
-        ]
-        ensure_output_directory(sent_output_path)
-        sent_output.to_csv(sent_output_path, index=False)
+    sent_columns = [
+        "property_A",
+        "property_B",
+        "corpus",
+        "count_A",
+        "count_B",
+        "count_AB",
+        "jaccard",
+        "dice",
+        "pmi",
+        "npmi",
+        "llr",
+    ]
+    if sent_output.empty:
+        sent_output = pd.DataFrame(columns=sent_columns)
+    else:
+        sent_output = sent_output[sent_columns]
+    ensure_output_directory(sent_output_path)
+    sent_output.to_csv(sent_output_path, index=False)
 
-    if not term_output.empty:
-        term_output = term_output[
-            [
-                "property_A",
-                "term_A",
-                "property_B",
-                "term_B",
-                "corpus",
-                "count_A",
-                "count_B",
-                "count_AB",
-                "jaccard",
-                "dice",
-                "pmi",
-                "npmi",
-                "llr",
-            ]
-        ]
-        ensure_output_directory(term_output_path)
-        term_output.to_csv(term_output_path, index=False)
+    term_columns = [
+        "property_A",
+        "term_A",
+        "property_B",
+        "term_B",
+        "corpus",
+        "count_A",
+        "count_B",
+        "count_AB",
+        "jaccard",
+        "dice",
+        "pmi",
+        "npmi",
+        "llr",
+    ]
+    if term_output.empty:
+        term_output = pd.DataFrame(columns=term_columns)
+    else:
+        term_output = term_output[term_columns]
+    ensure_output_directory(term_output_path)
+    term_output.to_csv(term_output_path, index=False)
+
+    focus_rows: List[Dict[str, object]] = []
+    combined_pair_counts = combined_doc_analysis["pair_counts"]
+    combined_property_counts = combined_doc_analysis["property_counts"]
+    combined_N = combined_doc_analysis["N"]
+    if len(focus_properties) >= 2:
+        for prop_a, prop_b in itertools.combinations(sorted(focus_property_set), 2):
+            key = tuple(sorted((prop_a, prop_b)))
+            count_a = combined_property_counts.get(prop_a, 0)
+            count_b = combined_property_counts.get(prop_b, 0)
+            count_ab = combined_pair_counts.get(key, 0)
+            metrics = compute_pair_metrics(count_a, count_b, count_ab, combined_N)
+            row = {"property_A": prop_a, "property_B": prop_b, "corpus": "COMBINED"}
+            row.update(metrics)
+            focus_rows.append(row)
+    focus_columns = [
+        "property_A",
+        "property_B",
+        "corpus",
+        "count_A",
+        "count_B",
+        "count_AB",
+        "jaccard",
+        "dice",
+        "pmi",
+        "npmi",
+        "llr",
+    ]
+    if len(focus_properties) < 2:
+        print(
+            "Not enough focus properties to compute pairwise relationships. "
+            "The dedicated output will be empty."
+        )
+    focus_output = pd.DataFrame(focus_rows)
+    if focus_output.empty:
+        focus_output = pd.DataFrame(columns=focus_columns)
+    else:
+        focus_output = focus_output[focus_columns]
+    ensure_output_directory(focus_output_path)
+    focus_output.to_csv(focus_output_path, index=False)
 
     top_rows: List[Dict[str, object]] = []
     metrics_for_ranking = ["jaccard", "dice", "npmi", "llr"]
@@ -647,11 +850,24 @@ def main() -> None:
                         }
                     )
 
+    top_columns = [
+        "level",
+        "corpus",
+        "metric",
+        "rank",
+        "property_A",
+        "property_B",
+        "value",
+        "count_AB",
+    ]
     top_output = pd.DataFrame(top_rows)
+    if top_output.empty:
+        top_output = pd.DataFrame(columns=top_columns)
+    else:
+        top_output = top_output[top_columns]
     top_output_path = output_base / "top_property_pairs.csv"
-    if not top_output.empty:
-        ensure_output_directory(top_output_path)
-        top_output.to_csv(top_output_path, index=False)
+    ensure_output_directory(top_output_path)
+    top_output.to_csv(top_output_path, index=False)
 
     combined_doc_df = doc_output[doc_output["corpus"] == "COMBINED"] if not doc_output.empty else pd.DataFrame()
     combined_sent_df = sent_output[sent_output["corpus"] == "COMBINED"] if not sent_output.empty else pd.DataFrame()
@@ -738,6 +954,7 @@ def main() -> None:
         doc_output_path,
         sent_output_path,
         term_output_path,
+        focus_output_path,
         top_output_path,
         *graph_paths,
         *heatmap_paths,
