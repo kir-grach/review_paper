@@ -66,6 +66,15 @@ def detect_text_column(df: pd.DataFrame, source_name: str) -> str:
     return best_column
 
 
+def safe_str_lower(series: pd.Series) -> pd.Series:
+    string_methods = series.str
+    lower = getattr(string_methods, "lower")
+    try:
+        return lower(errors="ignore")
+    except TypeError:
+        return lower()
+
+
 def load_abstracts(file_path: Path, source_name: str) -> List[str]:
     df = pd.read_csv(file_path)
     column_name = detect_text_column(df, source_name)
@@ -82,7 +91,7 @@ def load_abstracts(file_path: Path, source_name: str) -> List[str]:
     for original, replacement in DASH_REPLACEMENTS.items():
         series = series.str.replace(original, replacement, regex=False)
 
-    series = series.str.lower(errors="ignore")
+    series = safe_str_lower(series)
     series = series[series.str.len() > 0]
     return series.tolist()
 
