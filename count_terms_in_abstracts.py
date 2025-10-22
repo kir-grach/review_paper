@@ -112,9 +112,6 @@ def load_abstracts(file_path: Path, source_name: str) -> List[str]:
     column_name = detect_text_column(df, source_name)
     series = df[column_name]
 
-    if not pd.api.types.is_string_dtype(series):
-        series = series.astype(str)
-
     series = series.dropna()
     series = series.astype(str)
     series = series.str.strip()
@@ -206,8 +203,8 @@ def phrase_to_pattern(phrase: str, original_phrase: str) -> str | None:
 
     body = r"[\s\-]+".join(token_patterns)
 
-    start_boundary = "\b" if should_use_word_boundary(tokens[0], "start") else ""
-    end_boundary = "\b" if should_use_word_boundary(tokens[-1], "end") else ""
+    start_boundary = r"\b" if should_use_word_boundary(tokens[0], "start") else ""
+    end_boundary = r"\b" if should_use_word_boundary(tokens[-1], "end") else ""
 
     return f"{start_boundary}{body}{end_boundary}"
 
@@ -220,8 +217,8 @@ def abbreviation_to_pattern(abbreviation: str) -> str | None:
     if not normalized:
         return None
 
-    start_boundary = "\b" if should_use_word_boundary(normalized, "start") else ""
-    end_boundary = "\b" if should_use_word_boundary(normalized, "end") else ""
+    start_boundary = r"\b" if should_use_word_boundary(normalized, "start") else ""
+    end_boundary = r"\b" if should_use_word_boundary(normalized, "end") else ""
     escaped = re.escape(normalized)
     return f"{start_boundary}{escaped}{end_boundary}"
 
@@ -256,8 +253,8 @@ def term_to_patterns(term: str) -> Sequence[re.Pattern]:
 
     if not patterns and normalized_term:
         fallback_lower = normalize_dashes(normalized_term.lower())
-        start_boundary = "\b" if should_use_word_boundary(fallback_lower, "start") else ""
-        end_boundary = "\b" if should_use_word_boundary(fallback_lower, "end") else ""
+        start_boundary = r"\b" if should_use_word_boundary(fallback_lower, "start") else ""
+        end_boundary = r"\b" if should_use_word_boundary(fallback_lower, "end") else ""
         fallback_pattern = f"{start_boundary}{re.escape(fallback_lower)}{end_boundary}"
         patterns.append(re.compile(fallback_pattern))
 
@@ -309,7 +306,8 @@ def main() -> None:
         )
 
     result_df = pd.DataFrame(results)
-    output_path = Path("/mnt/data/term_frequencies.csv")
+    output_path = base_dir / "term_frequencies.csv"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     result_df.to_csv(output_path, index=False, encoding="utf-8")
 
     print(result_df.head(10))
