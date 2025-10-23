@@ -4,6 +4,7 @@ import itertools
 import math
 import re
 from collections import Counter
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Pattern, Set, Tuple
 
@@ -81,30 +82,40 @@ def resolve_input_path(
 
 
 def determine_output_base(output_dir: str, script_dir: Path) -> Path:
-    """Determine where result files should be written, preferring /mnt/data when available."""
+    """Determine where result files should be written, preferring a dedicated folder."""
 
-    candidates: List[Path] = []
     if output_dir:
-        candidates.append(Path(output_dir).expanduser())
-    else:
-        candidates.extend([
-            script_dir,
-            script_dir / "data",
-            Path("/mnt/data"),
-        ])
+        base = Path(output_dir).expanduser()
+        base.mkdir(parents=True, exist_ok=True)
+        return base
 
-    last_error: Optional[Exception] = None
-    for candidate in candidates:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    candidate_roots = [script_dir, Path.cwd(), Path("/mnt/data")]
+
+    for root in candidate_roots:
         try:
-            candidate.mkdir(parents=True, exist_ok=True)
-        except OSError as error:
-            last_error = error
+            root.mkdir(parents=True, exist_ok=True)
+        except OSError:
             continue
-        else:
-            return candidate
 
-    if last_error is not None:
-        raise last_error
+        base_root = root / "analysis_outputs"
+        try:
+            base_root.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            continue
+
+        candidate = base_root / timestamp
+        suffix = 1
+        while candidate.exists():
+            candidate = base_root / f"{timestamp}_{suffix:02d}"
+            suffix += 1
+
+        try:
+            candidate.mkdir(parents=True, exist_ok=False)
+        except OSError:
+            continue
+        return candidate
+
     raise OSError("Unable to establish output directory.")
 
 
@@ -437,6 +448,43 @@ def save_heatmap(matrix: pd.DataFrame, title: str, output_path: Path) -> None:
     ensure_output_directory(output_path)
     fig.savefig(output_path, dpi=300)
     plt.close(fig)
+
+
+def build_property_matrix_from_pairs(df: pd.DataFrame) -> Optional[pd.DataFrame]:
+    if df.empty:
+        return None
+
+    properties = sorted(set(df["property_A"]) | set(df["property_B"]))
+    if len(properties) < 2:
+        return None
+
+    matrix_npmi = pd.DataFrame(
+        np.nan,
+        index=properties,
+        columns=properties,
+        dtype=float,
+    )
+    matrix_llr = pd.DataFrame(
+        np.nan,
+        index=properties,
+        columns=properties,
+        dtype=float,
+    )
+
+    for row in df.itertuples(index=False):
+        prop_a = row.property_A
+        prop_b = row.property_B
+        npmi_val = getattr(row, "npmi", math.nan)
+        llr_val = getattr(row, "llr", math.nan)
+        matrix_npmi.loc[prop_a, prop_b] = npmi_val
+        matrix_npmi.loc[prop_b, prop_a] = npmi_val
+        matrix_llr.loc[prop_a, prop_b] = llr_val
+        matrix_llr.loc[prop_b, prop_a] = llr_val
+
+    np.fill_diagonal(matrix_npmi.values, 0.0)
+    np.fill_diagonal(matrix_llr.values, 0.0)
+    matrix_npmi.attrs["llr_matrix"] = matrix_llr
+    return matrix_npmi
 
 
 def main() -> None:
@@ -869,62 +917,58 @@ def main() -> None:
     ensure_output_directory(top_output_path)
     top_output.to_csv(top_output_path, index=False)
 
-    combined_doc_df = doc_output[doc_output["corpus"] == "COMBINED"] if not doc_output.empty else pd.DataFrame()
-    combined_sent_df = sent_output[sent_output["corpus"] == "COMBINED"] if not sent_output.empty else pd.DataFrame()
-
     heatmap_paths: List[Path] = []
     graph_paths: List[Path] = []
 
-    if not combined_doc_df.empty:
-        properties_sorted = sorted(set(combined_doc_df["property_A"]) | set(combined_doc_df["property_B"]))
-        matrix_npmi = pd.DataFrame(np.nan, index=properties_sorted, columns=properties_sorted)
-        matrix_llr = pd.DataFrame(np.nan, index=properties_sorted, columns=properties_sorted)
-        for _, row in combined_doc_df.iterrows():
-            a = row["property_A"]
-            b = row["property_B"]
-            npmi_val = row["npmi"]
-            llr_val = row["llr"]
-            matrix_npmi.loc[a, b] = npmi_val
-            matrix_npmi.loc[b, a] = npmi_val
-            matrix_llr.loc[a, b] = llr_val
-            matrix_llr.loc[b, a] = llr_val
-        np.fill_diagonal(matrix_npmi.values, 0.0)
-        np.fill_diagonal(matrix_llr.values, 0.0)
-        matrix_npmi.attrs["llr_matrix"] = matrix_llr
+    doc_matrices: Dict[str, pd.DataFrame] = {}
+    if not doc_output.empty:
+        for corpus_name in sorted(doc_output["corpus"].unique()):
+            subset = doc_output[doc_output["corpus"] == corpus_name]
+            matrix = build_property_matrix_from_pairs(subset)
+            if matrix is None:
+                continue
+            doc_matrices[corpus_name] = matrix
+            if corpus_name == "COMBINED":
+                doc_graph_filename = "property_network_doclevel.gexf"
+            else:
+                doc_graph_filename = f"property_network_doclevel_{corpus_name.lower()}.gexf"
+            doc_graph_path = output_base / doc_graph_filename
+            ensure_output_directory(doc_graph_path)
+            build_network_and_export(matrix, doc_graph_path, "npmi")
+            graph_paths.append(doc_graph_path)
 
-        doc_graph_path = output_base / "property_network_doclevel.gexf"
-        ensure_output_directory(doc_graph_path)
-        build_network_and_export(matrix_npmi, doc_graph_path, "npmi")
-        graph_paths.append(doc_graph_path)
+    sent_matrices: Dict[str, pd.DataFrame] = {}
+    if not sent_output.empty:
+        for corpus_name in sorted(sent_output["corpus"].unique()):
+            subset = sent_output[sent_output["corpus"] == corpus_name]
+            matrix = build_property_matrix_from_pairs(subset)
+            if matrix is None:
+                continue
+            sent_matrices[corpus_name] = matrix
+            if corpus_name == "COMBINED":
+                sent_graph_path = output_base / "property_network_sentlevel.gexf"
+                ensure_output_directory(sent_graph_path)
+                build_network_and_export(matrix, sent_graph_path, "npmi")
+                graph_paths.append(sent_graph_path)
 
+    combined_doc_matrix = doc_matrices.get("COMBINED")
+    if combined_doc_matrix is not None:
         heatmap_doc_path = output_base / "heatmap_properties_doclevel.png"
-        save_heatmap(matrix_npmi.fillna(0.0), "Property NPMI (Doc Level)", heatmap_doc_path)
+        save_heatmap(
+            combined_doc_matrix.fillna(0.0),
+            "Property NPMI (Doc Level)",
+            heatmap_doc_path,
+        )
         heatmap_paths.append(heatmap_doc_path)
 
-    if not combined_sent_df.empty:
-        properties_sorted = sorted(set(combined_sent_df["property_A"]) | set(combined_sent_df["property_B"]))
-        matrix_npmi = pd.DataFrame(np.nan, index=properties_sorted, columns=properties_sorted)
-        matrix_llr = pd.DataFrame(np.nan, index=properties_sorted, columns=properties_sorted)
-        for _, row in combined_sent_df.iterrows():
-            a = row["property_A"]
-            b = row["property_B"]
-            npmi_val = row["npmi"]
-            llr_val = row["llr"]
-            matrix_npmi.loc[a, b] = npmi_val
-            matrix_npmi.loc[b, a] = npmi_val
-            matrix_llr.loc[a, b] = llr_val
-            matrix_llr.loc[b, a] = llr_val
-        np.fill_diagonal(matrix_npmi.values, 0.0)
-        np.fill_diagonal(matrix_llr.values, 0.0)
-        matrix_npmi.attrs["llr_matrix"] = matrix_llr
-
-        sent_graph_path = output_base / "property_network_sentlevel.gexf"
-        ensure_output_directory(sent_graph_path)
-        build_network_and_export(matrix_npmi, sent_graph_path, "npmi")
-        graph_paths.append(sent_graph_path)
-
+    combined_sent_matrix = sent_matrices.get("COMBINED")
+    if combined_sent_matrix is not None:
         heatmap_sent_path = output_base / "heatmap_properties_sentlevel.png"
-        save_heatmap(matrix_npmi.fillna(0.0), "Property NPMI (Sentence Level)", heatmap_sent_path)
+        save_heatmap(
+            combined_sent_matrix.fillna(0.0),
+            "Property NPMI (Sentence Level)",
+            heatmap_sent_path,
+        )
         heatmap_paths.append(heatmap_sent_path)
 
     # Print top 10 pairs for GEOECO and GEOMORPHO (doc level)
